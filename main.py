@@ -1,109 +1,184 @@
-# main.py (Fixed version, fully compatible and error-free)
-import os
+# main.py
+
 import threading
 import time
-from flask import Flask
-from dotenv import load_dotenv
+from datetime import datetime
+from flask import Flask, jsonify, request
+import json
+import openai
+import pandas as pd
+
+from config import CONFIG
 from scanner_core import scan_altcoins
-from utils import check_and_log_performance, send_telegram_alert, send_performance_summary, optimize_config
+from utils import send_telegram_message, optimize_config
+from trade_logger import init_trade_log, log_trades
 
-load_dotenv()
+# Initialize the CSV for simulated trades
+init_trade_log()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-# === [1] Flask server + AI Config Route ===
 app = Flask(__name__)
 
-@app.route("/")
-def index():
-    return "🟢 Claude Scanner is alive!"
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok"}), 200
 
-@app.route("/ping")
-def ping():
-    return "pong"
-
-@app.route("/optimize")
-def optimize():
-    threading.Thread(target=optimize_config).start()
-    return "🧠 GPT optimization triggered."
-
-# === [2] GPT motivation message ===
-import openai
-
-client = openai.OpenAI()
-
-def get_motivational_message():
-    print("💬 Requesting GPT message...", flush=True)
-    prompt = (
-        "You are a witty, slightly cheeky but supportive AI friend named Jonty who helps a crypto trader named Yasper. "
-        "Each time the scanner starts or finishes, give him a motivational or funny one-liner that keeps him pumped and focused. "
-        "Make it personal and different every time. Return only the one-liner."
-    )
+@app.route("/optimize", methods=["POST"])
+def optimize_route():
+    """
+    Calls your GPT-based optimizer (in utils.optimize_config),
+    sends a Telegram summary, and returns the new params.
+    """
     try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
-            temperature=0.9
-        )
-        message = response.choices[0].message.content.strip()
-        print(f"🤖 GPT Motivator: {message}", flush=True)
-        return message
+        new_params = optimize_config()
+        send_telegram_message(f"⚙️ Config optimized: {json.dumps(new_params)}")
+        return jsonify({"optimized_params": new_params}), 200
     except Exception as e:
-        print(f"❌ GPT Error: {e}", flush=True)
-        return "🧠 Let’s crush it this round, Yasper! (GPT down fallback.)"
+        send_telegram_message(f"❌ Error during optimization: {e}")
+        return jsonify({"error": str(e)}), 500
 
-# === [3] Main scan + alert function ===
-def run_and_alert():
-    from utils import check_and_log_performance  # if not already imported
-    check_and_log_performance.start_time = time.time()
-    print("🔁 Running scanner + sending alerts...", flush=True)
+@app.route("/analyze", methods=["GET"])
+def analyze_route():
+    """
+    Reads simulated_trades.csv and returns performance summaries:
+    - overall metrics
+    - by signal_combo
+    - by market_regime
+    """
     try:
-        motivator = get_motivational_message()
+        df = pd.read_csv("simulated_trades.csv")
+        total = len(df)
+        wins = int((df["outcome"] == "win").sum())
+        losses = int((df["outcome"] == "loss").sum())
+        pendings = int((df["outcome"] == "pending").sum())
+        win_rate = round(wins / total, 3) if total else None
+        avg_rr = round(df["rr_ratio"].dropna().mean(), 3) if not df["rr_ratio"].dropna().empty else None
+
+        # Aggregate by signal_combo
+        signal_stats = {}
+        for combo, group in df.groupby("signal_combo"):
+            ct = len(group)
+            w = int((group["outcome"] == "win").sum())
+            l = int((group["outcome"] == "loss").sum())
+            p = int((group["outcome"] == "pending").sum())
+            signal_stats[combo] = {
+                "count": ct,
+                "wins": w,
+                "losses": l,
+                "pending": p,
+                "win_rate": round(w / ct, 3) if ct else None,
+                "avg_rr": round(group["rr_ratio"].dropna().mean(), 3) if not group["rr_ratio"].dropna().empty else None
+            }
+
+        # Aggregate by market_regime
+        regime_stats = {}
+        for regime, group in df.groupby("market_regime"):
+            ct = len(group)
+            w = int((group["outcome"] == "win").sum())
+            l = int((group["outcome"] == "loss").sum())
+            p = int((group["outcome"] == "pending").sum())
+            regime_stats[regime] = {
+                "count": ct,
+                "wins": w,
+                "losses": l,
+                "pending": p,
+                "win_rate": round(w / ct, 3) if ct else None,
+                "avg_rr": round(group["rr_ratio"].dropna().mean(), 3) if not group["rr_ratio"].dropna().empty else None
+            }
+
+        summary = {
+            "overall": {
+                "total_trades": total,
+                "wins": wins,
+                "losses": losses,
+                "pending": pendings,
+                "win_rate": win_rate,
+                "avg_rr": avg_rr
+            },
+            "by_signal_combo": signal_stats,
+            "by_market_regime": regime_stats
+        }
+
+        return jsonify(summary), 200
+
     except Exception as e:
-        motivator = "⚠️ GPT failed (handled)"
-        print(f"❌ GPT Error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
-    try:
-        safe_msg = f"🎯 New scan starting! {motivator}".replace("“", '"').replace("”", '"').replace("’", "'").replace("•", "-")
-        send_telegram_alert(safe_msg)
-        print("📨 Telegram alert sent", flush=True)
-    except Exception as e:
-        print(f"❌ Telegram send error: {e}", flush=True)
-
-    print("🔍 Scanning in progress...", flush=True)
-    results = scan_altcoins(progress_callback=lambda i, total: print(f"\r📊 Scanned {i}/{total} coins", end="", flush=True))
-    high_score_trades = [t for t in results if t['score'] >= 6.5][:5]
-
-    check_and_log_performance(high_score_trades)
-
-    if not high_score_trades:
-        send_telegram_alert("⚠️ No high-conviction trades this round.")
-    else:
-        for trade in high_score_trades:
-            msg = (
-                f"🚀 {trade['symbol']} (Score: {trade['score']:.1f})\n"
-                f"Entry: ${trade['entry']:.8f}\n"
-                f"Stop:  ${trade['stop_loss']:.8f}\n"
-                f"TP1:   ${trade['take_profit1']:.8f} (R:R {trade['risk_reward1']})\n"
-                f"TP2:   ${trade['take_profit2']:.8f} (R:R {trade['risk_reward2']})\n"
-                f"Signal: {trade['signals'][0] if trade['signals'] else 'N/A'}"
-            )
-            clean_msg = msg.replace("“", '"').replace("”", '"').replace("’", "'").replace("•", "-")
-            send_telegram_alert(clean_msg)
-
-    send_performance_summary()
-    send_telegram_alert("✅ Scan complete. Sleeping 30 mins...")
-    print("✅ Scan complete. Sleeping 30 mins...", flush=True)
-
-# === [4] Background scan loop ===
-def background_loop():
+def background_scan_loop():
+    """
+    Runs forever: every CONFIG['scan_interval'] seconds runs a full scan,
+    logs the top 5 simulated trades, and pushes a Telegram alert for the #1 signal.
+    """
+    interval = CONFIG.get("scan_interval", 300)
     while True:
-        run_and_alert()
-        time.sleep(60 * 30)
+        try:
+            results = scan_altcoins()  # returns list of dicts with keys:
+                                       #   symbol, score, entry, tp, sl,
+                                       #   last_price, signal_combo, regime, trend_strength
 
-# === [5] Start server + scanner ===
+            if not results:
+                time.sleep(interval)
+                continue
+
+            # 1) Simulate & log top 5 trades
+            top5 = sorted(results, key=lambda x: x.get("score", 0), reverse=True)[:5]
+            to_log = []
+            for r in top5:
+                entry = r.get("entry")
+                tp    = r.get("tp")
+                sl    = r.get("sl")
+                last  = r.get("last_price")
+
+                # Determine outcome
+                if last is None:
+                    outcome = "pending"
+                elif tp is not None and last >= tp:
+                    outcome = "win"
+                elif sl is not None and last <= sl:
+                    outcome = "loss"
+                else:
+                    outcome = "pending"
+
+                # Compute R:R
+                rr = None
+                if entry is not None and tp is not None and sl is not None and (entry - sl) != 0:
+                    rr = (tp - entry) / (entry - sl)
+
+                to_log.append({
+                    "timestamp":     datetime.utcnow().isoformat(),
+                    "symbol":        r.get("symbol"),
+                    "entry_price":   entry,
+                    "tp_price":      tp,
+                    "sl_price":      sl,
+                    "outcome":       outcome,
+                    "signal_combo":  r.get("signal_combo"),
+                    "rr_ratio":      round(rr, 3) if rr is not None else None,
+                    "market_regime": r.get("regime"),
+                    "trend_strength":r.get("trend_strength"),
+                })
+
+            log_trades(to_log)
+
+            # 2) Send Telegram alert for the top 1 signal
+            top = top5[0]
+            msg = (
+                f"🔍 [{datetime.utcnow().isoformat()}] Top signal:\n"
+                f"Symbol: {top.get('symbol')}\n"
+                f"Score: {top.get('score'):.2f}\n"
+                f"Entry: {top.get('entry')}, TP: {top.get('tp')}, SL: {top.get('sl')}"
+            )
+            send_telegram_message(msg)
+
+        except Exception as err:
+            # Catch-all so one failure doesn't kill the loop
+            send_telegram_message(f"❌ Scan loop error: {err}")
+
+        time.sleep(interval)
+
 if __name__ == "__main__":
-    threading.Thread(target=background_loop).start()
-    app.run(host="0.0.0.0", port=8080)
+    # Start background scanner
+    thread = threading.Thread(target=background_scan_loop, daemon=True)
+    thread.start()
+
+    # Launch Flask API
+    port = CONFIG.get("port", 5000)
+    app.run(host="0.0.0.0", port=port)

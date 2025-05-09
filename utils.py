@@ -1,123 +1,169 @@
+# utils.py
+
 import os
+import json
 import requests
 import pandas as pd
-import numpy as np
+import openai
+from typing import Dict, List, Union
 import ccxt
-import ta
-from datetime import datetime
-from dotenv import load_dotenv
-import time
+from config import CONFIG
 
-load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# === [1] Telegram Alert ===
-def send_telegram_alert(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+def send_telegram_message(text: str) -> None:
+    """
+    Sends a message to your configured Telegram chat.
+    """
+    token = CONFIG.get("telegram_token")
+    chat_id = CONFIG.get("telegram_chat_id")
+    if not token or not chat_id:
+        raise ValueError("Missing Telegram configuration")
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    resp = requests.post(url, json=payload)
+    resp.raise_for_status()
+
+
+def fetch_market_data(symbol: str, timeframe: str = "1h", limit: int = 100) -> pd.DataFrame:
+    """
+    Fetches OHLCV data for a symbol using the exchange specified in CONFIG
+    (default 'mexc') and returns a DataFrame. Symbols without a slash
+    will default to the quote currency (e.g. 'USDT').
+
+    Adds debug logs to ensure correct exchange instantiation and symbol normalization.
+    """
+    # Resolve exchange name
+    exch = CONFIG.get("exchange", "mexc")
+    # Ensure string
+    if not isinstance(exch, str):
+        # If user mistakenly stored a class/object
+        exch = getattr(exch, 'id', None) or getattr(exch, '__name__', str(exch)).lower()
+    exch_name = exch.lower()
+    print(f"[DEBUG] exch_name={exch_name!r}, type={type(exch_name)}")
+
+    # Get ccxt exchange class
+    if not hasattr(ccxt, exch_name):
+        raise ValueError(f"Unsupported exchange '{exch_name}' in CONFIG")
+    exchange_cls = getattr(ccxt, exch_name)
+
+    # Prepare credentials
+    creds: Dict[str, str] = {}
+    api_key = CONFIG.get(f"{exch_name}_api_key")
+    secret = CONFIG.get(f"{exch_name}_api_secret")
+    if api_key:
+        creds["apiKey"] = api_key
+    if secret:
+        creds["secret"] = secret
+
+    # Instantiate exchange
     try:
-        res = requests.post(url, data=payload)
-        print("📨 Telegram response:", res.status_code, res.text, flush=True)
+        exchange = exchange_cls(creds)
     except Exception as e:
-        print(f"❌ Telegram send error: {e}", flush=True)
+        raise RuntimeError(f"Failed to init {exch_name} exchange: {e}")
+    print(f"[DEBUG] exchange instance={exchange}, type={type(exchange)}")
 
-# === [2] Market Data ===
-def fetch_market_data(symbol, exchange):
+    # Load markets once
+    if not getattr(exchange, 'markets', None):
+        exchange.load_markets()
+
+    # Normalize symbol to include quote if missing
+    if "/" not in symbol:
+        base = symbol.upper()
+        quote = CONFIG.get("quote_currency", "USDT").upper()
+        symbol = f"{base}/{quote}"
+    print(f"[DEBUG] normalized symbol={symbol}")
+
+    # Validate symbol
+    if symbol not in exchange.markets:
+        raise ValueError(f"{exch_name} does not have market symbol {symbol}")
+
+    # Fetch OHLCV
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df["symbol"] = symbol
+    return df
+
+
+def analyze_coin(df: pd.DataFrame) -> Dict:
+    """
+    Example analysis: computes RSI-based score, entry/TP/SL levels, regime, and trend strength.
+    """
+    import ta
+    df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+    latest = df.iloc[-1]
+    score = 100 - latest["rsi"]
+    entry = latest["close"] * (1 - CONFIG.get("entry_buffer", 0.01))
+    tp = latest["close"] * (1 + CONFIG.get("tp_multiplier", 0.02))
+    sl = latest["close"] * (1 - CONFIG.get("sl_multiplier", 0.03))
+    regime = (
+        "bull"
+        if df["close"].pct_change().rolling(50).mean().iloc[-1] > 0
+        else "bear"
+    )
+    trend_strength = abs(df["close"].pct_change().rolling(5).mean().iloc[-1])
+    signal_combo = "rsi_reversal"
+    return {
+        "symbol": df["symbol"].iloc[0],
+        "score": score,
+        "entry": entry,
+        "tp": tp,
+        "sl": sl,
+        "last_price": latest["close"],
+        "signal_combo": signal_combo,
+        "regime": regime,
+        "trend_strength": trend_strength,
+    }
+
+
+def optimize_config() -> Dict:
+    """
+    Auto-tunes configuration parameters based on historical simulated trades.
+
+    Loads `simulated_trades.csv`, summarizes performance, queries GPT for
+    new parameter values, and saves them to `dynamic_config.json`.
+    """
+    df = pd.read_csv("simulated_trades.csv")
+    total = len(df)
+    wins = int((df["outcome"] == "win").sum())
+    win_rate = wins / total if total else 0.0
+    avg_rr = float(df["rr_ratio"].dropna().mean()) if not df["rr_ratio"].dropna().empty else 0.0
+
+    prompt = f"""
+You are a trading strategy optimizer.
+
+Recent performance:
+- Total trades: {total}
+- Win rate: {win_rate:.3f}
+- Avg R:R: {avg_rr:.3f}
+
+Current configuration values:
+- score_threshold: {CONFIG.get('score_threshold')}
+- atr_multiplier: {CONFIG.get('atr_multiplier')}
+- top_coins_limit: {CONFIG.get('top_coins_limit')}
+
+Suggest improved numeric values for these parameters to enhance win rate and reward-to-risk.
+Return the suggestions as a JSON object with keys:
+"score_threshold", "atr_multiplier", "top_coins_limit"
+"""
+
+    openai.api_key = CONFIG.get("openai_api_key")
+    response = openai.ChatCompletion.create(
+        model=CONFIG.get("openai_model", "gpt-4-mini"),
+        messages=[
+            {"role": "system", "content": "You are a helpful AI assistant."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=CONFIG.get("openai_temperature", 0.7)
+    )
+    content = response.choices[0].message.content.strip()
+
     try:
-        bars = exchange.fetch_ohlcv(f"{symbol}/USDT", timeframe='15m', limit=150)
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        return df
-    except Exception as e:
-        print(f"⚠️ Failed to fetch market data for {symbol}: {e}", flush=True)
-        return None
+        new_params = json.loads(content)
+    except json.JSONDecodeError:
+        raise ValueError(f"Invalid JSON from GPT: {content}")
 
-# === [3] Analyzer ===
-def analyze_coin(symbol, df):
-    try:
-        close = df['close']
-        high = df['high']
-        low = df['low']
-        volume = df['volume']
+    with open("dynamic_config.json", "w") as f:
+        json.dump(new_params, f, indent=2)
 
-        ema9 = ta.trend.EMAIndicator(close, window=9).ema_indicator().iloc[-1]
-        ema21 = ta.trend.EMAIndicator(close, window=21).ema_indicator().iloc[-1]
-        ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator().iloc[-1]
-        macd = ta.trend.MACD(close).macd_diff()
-        macd_prev, macd_now = macd.iloc[-2], macd.iloc[-1]
-        rsi = ta.momentum.RSIIndicator(close).rsi()
-        rsi_prev, rsi_now = rsi.iloc[-2], rsi.iloc[-1]
-        atr = ta.volatility.AverageTrueRange(high, low, close).average_true_range().iloc[-1]
-        adx = ta.trend.ADXIndicator(high, low, close).adx().iloc[-1]
-
-        signals = []
-        score = 0.0
-
-        # EMA alignment
-        if ema9 > ema21 > ema50:
-            signals.append("EMA alignment bullish")
-            score += 0.8
-
-        # MACD crossover
-        if macd_prev < 0 and macd_now > 0:
-            signals.append("MACD bullish crossover")
-            score += 1.5
-
-        # RSI bounce
-        if rsi_now > 40 and rsi_prev < 40:
-            signals.append("RSI recovery")
-            score += 1.0
-
-        # Volume spike
-        if volume.iloc[-1] > 1.8 * volume.iloc[-20:].mean():
-            signals.append("Volume spike")
-            score += 1.2
-
-        # Market regime bonus
-        if adx > 25 and ema9 > ema21:
-            score += 0.5
-
-        if score < 1.0:
-            return None
-
-        # Entry logic
-        strong_trend = adx > 30
-        atr_multiplier = 3.0 if strong_trend else 2.0
-        entry_price = max(ema21 * 1.003, close.iloc[-1])
-        stop_loss = entry_price - atr * atr_multiplier
-        take_profit1 = entry_price + (entry_price - stop_loss) * 3
-        take_profit2 = entry_price + (entry_price - stop_loss) * 5
-
-        return {
-            "symbol": symbol,
-            "score": round(score, 2),
-            "entry": round(entry_price, 8),
-            "stop_loss": round(stop_loss, 8),
-            "take_profit1": round(take_profit1, 8),
-            "take_profit2": round(take_profit2, 8),
-            "risk_reward1": 3,
-            "risk_reward2": 5,
-            "signals": signals
-        }
-    except Exception as e:
-        print(f"❌ Error analyzing {symbol}: {e}", flush=True)
-        return None
-
-# === [4] Performance logging ===
-def send_performance_summary():
-    print("📊 Performance summary not implemented yet.", flush=True)
-
-def check_and_log_performance(trades):
-    end_time = time.time()
-    if hasattr(check_and_log_performance, 'start_time'):
-        duration = end_time - check_and_log_performance.start_time
-        print(f"⏱️ Scan took {duration:.2f} seconds", flush=True)
-    else:
-        print("⏱️ Scan timing not initialized.", flush=True)
-    print(f"📈 {len(trades)} high-conviction trades found", flush=True)
-
-# === [5] Optional config optimization ===
-def optimize_config():
-    print("🧠 GPT-based config optimization triggered (not implemented)", flush=True)
+    return new_params
